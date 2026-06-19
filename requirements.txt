@@ -1,0 +1,5 @@
+python-dotenv==1.2.2
+requests==2.34.2
+requests-oauthlib==2.0.0
+beautifulsoup4==4.15.0
+playwright==1.60.0
