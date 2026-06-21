@@ -1,5 +1,7 @@
 import os
+import json
 import random
+import re
 import time
 import requests
 from dotenv import load_dotenv
@@ -15,31 +17,32 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 # ========================= CONFIG =========================
 # A random topic is picked from this list each run (split into individual search terms).
 TOPICS = [
-    "Backend Development", "Cloud Computing", "Python", "Java", "AI",
-    "FastAPI", "Django", "Spring Boot", "PostgreSQL", "AWS",
-    "IoT", "IIoT", "Linux", "RedHat", "Fedora", "Open Source", "Kubernetes", "Docker", "DevOps", "CI/CD",
-    "تقنية المعلومات", "الذكاء الاصطناعي", "البرمجة", "تطوير البرمجيات", "الحوسبة السحابية", "أمن المعلومات",
+    "الذكاء الاصطناعي", "تعلم الآلة", "الشبكات",
+    "البرمجة", "تطوير البرمجيات", "الحوسبة السحابية", "أمن المعلومات", "تكنولوجيا المعلومات",
+    "الإنترنت الأشياء", "البرمجيات مفتوحة المصدر"
 ]
 
 NUM_POSTS = 8                # how many posts to pull from search
-POSTS_PER_TOPIC = 2          # how many random posts to engage with before switching topic
-TOPIC_INTERVAL = (300, 600)  # seconds to wait between topics (5-10 min), randomized
+POSTS_PER_TOPIC = 3          # how many random posts to engage with before switching topic
+TOPIC_INTERVAL = (900, 1800)  # seconds to wait between topics (15-30 min), randomized
+TOPIC_INTERVAL = (240, 300) # seconds to wait between topics (4-5 min), randomized
+DATE_FILTER = "past-24h"     # recency filter: "past-24h", "past-week", "past-month", or "" for any
 
 # Reaction picker mapping (single keypress -> LinkedIn reaction name).
 # REACTIONS = {"l": "Like", "c": "Celebrate", "s": "Support", "o": "Love", "i": "Insightful", "f": "Funny"}
 REACTIONS = {"l": "Like", "c": "Celebrate", "s": "Support", "o": "Love", "i": "Insightful"}
 
 SESSION_FILE = "linkedin_session.json"  # saved login; created on first run
-headless_mode = True         # keep visible: safer, and you can watch / intervene
+headless_mode = False         # keep visible: safer, and you can watch / intervene
 
 # Gemini: drafts a relevant comment per post. Keys are load-balanced via random.choice.
 GEMINI_KEYS = [k for k in (os.getenv("gemini_api_key_1"), os.getenv("gemini_api_key_2"), os.getenv("gemini_api_key_3"), os.getenv("gemini_api_key_4")) if k]
 GEMINI_MODEL = "gemini-2.5-flash-lite"  # cheapest current model
 
 # Human-like pacing (seconds). Randomized so behavior isn't robotic.
-DELAY_BETWEEN_POSTS = (15, 30)
-DELAY_AFTER_TYPING = (1.5, 4.0)
-SCROLL_PAUSE = (1.5, 3.5)
+DELAY_BETWEEN_POSTS = (4.75, 9.5)
+DELAY_AFTER_TYPING = (2.85, 7.6)
+SCROLL_PAUSE = (2.85, 6.65)
 # =========================================================
 
 
@@ -49,24 +52,78 @@ def _sleep(rng):
     time.sleep(random.uniform(lo, hi))
 
 
-def generate_comment(post_text, max_attempts=5):
-    """Draft a short, relevant LinkedIn comment for `post_text` using Gemini.
+_UI_NOISE = {
+    "feed post", "follow", "like", "comment", "repost", "send", "more",
+    "see more", "…more", "see translation", "subscribe",
+    "reactions", "comments", "reposts", "activate to view larger image,",
+}
+# "12 reactions", "3 comments", "5 reposts", "1 comment"
+_COUNT_LINE = re.compile(r"^\d[\d,\.]*\s*(reactions?|comments?|reposts?)$", re.I)
+_ARABIC = re.compile(r"[؀-ۿ]")  # any Arabic character
 
-    Gemini's flash-lite endpoint often returns transient 503/429 (overloaded / rate-limit).
-    We retry, rotating across keys with exponential backoff, so a blip doesn't kill the draft.
-    Returns the generated text, or None if every attempt failed (caller decides what to do)."""
+
+def _clean_post_text(raw):
+    """Strip LinkedIn UI chrome (Follow/Like/Comment/…, counts, '• 3rd+') so the post BODY
+    dominates — otherwise English labels make Gemini reply in English on Arabic posts."""
+    lines = []
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low in _UI_NOISE:
+            continue
+        if s.isdigit() or _COUNT_LINE.match(s):   # reaction / comment counts
+            continue
+        if s.startswith("•") or s.endswith("•"):  # "• 3rd+", "2h •"
+            continue
+        lines.append(s)
+    # Drop the first 1-2 lines (author name + headline/connection degree), keep the body.
+    body = lines[2:] if len(lines) > 3 else lines
+    return "\n".join(body).strip() or raw.strip()
+
+
+def _parse_gemini_json(raw):
+    """Extract {"is_job": bool, "comment": str} from Gemini's reply (tolerates code fences)."""
+    try:
+        start, end = raw.find("{"), raw.rfind("}")
+        obj = json.loads(raw[start:end + 1])
+        return bool(obj.get("is_job", False)), (obj.get("comment") or "").strip()
+    except Exception:
+        # Couldn't parse JSON — treat the whole reply as a non-job comment so we don't lose it.
+        return False, raw.strip()
+
+
+def generate_comment(post_text, max_attempts=5):
+    """Classify the post and draft a comment with Gemini.
+
+    Returns (is_job, comment):
+      - is_job=True  -> post is a job/hiring announcement; caller should NOT comment.
+      - comment=str  -> the drafted comment (when not a job post).
+      - (False, None) -> generation failed after retries; caller decides.
+
+    Gemini's flash-lite endpoint often returns transient 503/429; we retry across keys."""
     if not GEMINI_KEYS:
-        return None
+        return False, None
+    body = _clean_post_text(post_text)  # remove English UI chrome before language detection
+    # Deterministic language rule: posts here are often bilingual (Arabic + English translation).
+    # If any Arabic is present, force Arabic; otherwise match the post's language.
+    if _ARABIC.search(body):
+        lang_rule = "The comment MUST be written ENTIRELY in Arabic, even if the post also contains English."
+    else:
+        lang_rule = "Write the comment ENTIRELY in the same language as the post (English -> English). Never mix languages."
     prompt = (
-        "Write a thoughtful, professional LinkedIn comment (1-2 sentences, under 280 chars) "
-        "reacting to the post below. Write the comment in the SAME language as the post "
-        "(e.g. if the post is in Arabic, reply in Arabic). "
-        "Add real value: share a concrete insight, a relevant experience, or a sharp point "
-        "that extends the discussion. Make a confident statement, NOT a question — "
-        "do not end with a question mark. Avoid generic praise and filler. "
-        "Sound like an expert practitioner. No hashtags, no emojis, no greetings, "
-        "just the comment text.\n\n"
-        f"POST:\n{post_text[:1500]}"
+        "You are given the body of a LinkedIn post. First decide if it is a job/hiring "
+        "announcement or recruitment callout (e.g. 'we are hiring', a job listing, 'apply now', "
+        "'open position'). Respond ONLY with a JSON object, no markdown, of the form:\n"
+        '{"is_job": true|false, "comment": "<text>"}\n'
+        "If is_job is true, set comment to an empty string.\n"
+        f"Otherwise, write 'comment' reacting to the post. CRITICAL LANGUAGE RULE: {lang_rule}\n"
+        "Make it a thoughtful, professional comment (1-2 sentences, under 280 chars) that adds "
+        "real value: a concrete insight, relevant experience, or sharp point. Make a confident "
+        "statement, NOT a question — no question mark. Avoid generic praise and filler. "
+        "Sound like an expert practitioner. No hashtags, no emojis, no greetings.\n\n"
+        f"POST:\n{body[:1500]}"
     )
     keys = random.sample(GEMINI_KEYS, len(GEMINI_KEYS))  # shuffle so load spreads across keys
     for attempt in range(max_attempts):
@@ -77,7 +134,8 @@ def generate_comment(post_text, max_attempts=5):
             if r.status_code == 200:
                 text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if text:
-                    return text
+                    is_job, comment = _parse_gemini_json(text)
+                    return is_job, (comment or None)
             elif r.status_code in (429, 500, 503):
                 wait = min(2 ** attempt, 8) + random.uniform(0, 1)  # backoff: ~1,2,4,8s + jitter
                 print(f"  …Gemini {r.status_code} (overloaded), retry {attempt + 1}/{max_attempts} in {wait:.1f}s")
@@ -85,12 +143,12 @@ def generate_comment(post_text, max_attempts=5):
                 continue
             else:
                 print(f"  ! Gemini {r.status_code}: {r.text[:120]}")
-                return None
+                return False, None
         except Exception as e:
             print(f"  ! Gemini request error ({e}), retry {attempt + 1}/{max_attempts}")
             time.sleep(1)
     print("  ! Gemini unavailable after retries.")
-    return None
+    return False, None
 
 
 def ensure_logged_in(context, page):
@@ -114,7 +172,9 @@ def ensure_logged_in(context, page):
 def discover_posts(page, topic, num_posts):
     """Open content search for `topic`, scroll, and extract posts via accessibility anchors."""
     url = f"https://www.linkedin.com/search/results/content/?keywords={topic}&origin=SWITCH_SEARCH_VERTICAL"
-    print(f"Searching posts about '{topic}'...")
+    if DATE_FILTER:
+        url += f"&datePosted=%22{DATE_FILTER}%22"  # %22 = the literal quotes LinkedIn requires
+    print(f"Searching posts about '{topic}' (within {DATE_FILTER or 'any time'})...")
     page.goto(url, wait_until="domcontentloaded")
     _sleep((3, 5))
 
@@ -216,6 +276,7 @@ def react_to_post(page, post, reaction):
     like.scroll_into_view_if_needed()
     _sleep((1, 2.5))
 
+    applied = reaction
     if reaction == "Like":
         like.click()
     else:
@@ -225,10 +286,11 @@ def react_to_post(page, post, reaction):
         if opt.count() == 0:
             print(f"  ! '{reaction}' not in flyout — defaulting to Like.")
             like.click()
+            applied = "Like"  # report what actually happened
         else:
             opt.click()
     _sleep((1, 2.5))
-    print(f"  ✓ Reacted: {reaction}")
+    print(f"  ✓ Reacted: {applied}")
     return True
 
 
@@ -238,7 +300,13 @@ def review_and_engage(page, posts):
     Returns "quit" if the user asked to stop the whole run."""
     posted = 0
     for idx, post in enumerate(posts, 1):
-        post["container"].scroll_into_view_if_needed()
+        # After engaging a post the feed re-renders/scrolls, which can detach a later
+        # post's locator. Fail fast (don't wait the default 30s) and skip if unreachable.
+        try:
+            post["container"].scroll_into_view_if_needed(timeout=8000)
+        except Exception:
+            print(f"[{idx}/{len(posts)}] {post['author']}: post no longer reachable — skipping.")
+            continue
         _sleep((1, 3))
         full_text = expand_text(post)  # read the whole post before deciding
 
@@ -260,16 +328,15 @@ def review_and_engage(page, posts):
         # if input("Comment on this post? (y/N): ").strip().lower() == "y":
         if random.choice([True, True, True, False]) == True:  # 75% chance
             print("  Generating comment with Gemini...")
-            suggestion = generate_comment(full_text)
-            if suggestion:
+            is_job, suggestion = generate_comment(full_text)
+            if is_job:
+                print("  Job/hiring post — skipping comment.")
+            elif suggestion:
                 print(f"\nGemini draft: {suggestion}")
-                # draft = input("Edit, or press Enter to use it: ").strip() or suggestion
-                draft = suggestion
+                if comment_on_post(page, post, suggestion):
+                    posted += 1
             else:
-                draft = input("Gemini failed. Type a comment (or Enter to skip): ").strip()
-
-            if draft and comment_on_post(page, post, draft):
-                posted += 1
+                print("  No comment generated — skipping.")
 
         _sleep(DELAY_BETWEEN_POSTS)
 
